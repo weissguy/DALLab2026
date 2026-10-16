@@ -166,12 +166,14 @@ def plot_condition(
 
 
 def pca_analytes(
-    df: pd.DataFrame, analytes: list[str], il1b_pos_only: bool = False
+    df: pd.DataFrame, analytes: list[str], il1b_pos_only: bool = False,
+    color_by: str = "num macrophages",
 ) -> tuple[PCA, plt.Figure]:
     """
     Plots PCA of all analytes.
 
     - df: df with observations as rows and cytokines as columns
+    - color_by: "num macrophages" or "num ESCs"; shown as a continuous gradient
     - il1b_pos_only: ...
         - if True, subsets to only saw_il1b=True
         - else, plots both +IL1B and -IL1B (some conditions have many NA)
@@ -179,20 +181,26 @@ def pca_analytes(
     Returns:
     - pca: PCA object fit
     """
+    if color_by not in {"num macrophages", "num ESCs"}:
+        raise ValueError(
+            'color_by must be "num macrophages" or "num ESCs".'
+        )
     plot_data = df.copy()
     if il1b_pos_only:
         plot_data = plot_data[plot_data["saw_il1b"]]
 
     # PCA cannot accept missing values, so use samples complete for all analytes.
     plot_data = plot_data.dropna(subset=analytes)
-    conditions = plot_data["condition"]
+    color_values = pd.to_numeric(plot_data[color_by], errors="raise")
+    if color_values.isna().any() or color_values.isin([float("inf"), -float("inf")]).any():
+        raise ValueError(f"{color_by} must contain finite counts for every plotted sample.")
     X_scaled = StandardScaler().fit_transform(plot_data[analytes].values)
 
     pca = PCA(n_components=min(4, len(analytes), len(plot_data)))
     X_pca = pca.fit_transform(X_scaled)
     pca_df = pd.DataFrame(
         {
-            "condition": conditions.values,
+            "color_value": color_values.values,
             "saw_il1b": plot_data["saw_il1b"].values,
             "PC1": X_pca[:, 0],
             "PC2": X_pca[:, 1],
@@ -200,16 +208,16 @@ def pca_analytes(
     )
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    cmap = plt.get_cmap("RdYlBu")
+    cmap = plt.get_cmap("viridis")
     norm = mcolors.Normalize(
-        vmin=pca_df["condition"].min(), vmax=pca_df["condition"].max()
+        vmin=pca_df["color_value"].min(), vmax=pca_df["color_value"].max()
     )
 
     if il1b_pos_only:
         ax.scatter(
             pca_df["PC1"],
             pca_df["PC2"],
-            c=pca_df["condition"],
+            c=pca_df["color_value"],
             cmap=cmap,
             norm=norm,
         )
@@ -220,7 +228,7 @@ def pca_analytes(
             ax.scatter(
                 subset["PC1"],
                 subset["PC2"],
-                c=subset["condition"],
+                c=subset["color_value"],
                 cmap=cmap,
                 norm=norm,
                 marker=marker,
@@ -229,28 +237,10 @@ def pca_analytes(
                 label=f"saw_il1b={il1b_val}",
             )
 
-    # build legend (color)
-    unique_conditions = sorted(pca_df["condition"].unique())
-    color_handles = [
-        Line2D(
-            [0],
-            [0],
-            marker="s",
-            linestyle="",
-            markerfacecolor=cmap(norm(condition)),
-            markeredgecolor="none",
-            markersize=8,
-            label=CONDITION_MAP.get(condition, str(condition)),
-        )
-        for condition in unique_conditions
-    ]
-    first_legend = ax.legend(
-        handles=color_handles,
-        title="Condition",
-        loc="upper left",
-        bbox_to_anchor=(1.02, 1.0),
+    colorbar = fig.colorbar(
+        plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, pad=0.03
     )
-    ax.add_artist(first_legend)
+    colorbar.set_label(color_by)
 
     if not il1b_pos_only:
         # build legend (shape)
@@ -270,12 +260,46 @@ def pca_analytes(
         ax.legend(
             handles=shape_handles,
             title="IL-1B",
-            loc="lower left",
-            bbox_to_anchor=(1.02, 0.0),
+            loc="best",
         )
 
     ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0] * 100:.1f}%)")
     ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1] * 100:.1f}%)")
     ax.set_title("PCA of Luminex Analytes")
+    fig.tight_layout()
+    return pca, fig
+
+
+def pca_transposed_analytes(
+    df: pd.DataFrame, analytes: list[str], il1b_pos_only: bool = False
+) -> tuple[PCA, plt.Figure]:
+    """Plot analytes using condition means as PCA features.
+
+    Average replicates within each condition, then transpose to analyte rows
+    and condition columns. Unless il1b_pos_only is True, the means include
+    both IL-1B groups. Standardize each condition column across analytes.
+    """
+    plot_data = df[df["saw_il1b"]] if il1b_pos_only else df
+    condition_means = plot_data.groupby("condition")[analytes].mean()
+    matrix = condition_means.T.dropna()
+    if min(matrix.shape) < 2:
+        raise ValueError(
+            "Transposed PCA requires at least two complete analytes and two conditions."
+        )
+    scaled = StandardScaler().fit_transform(matrix)
+    pca = PCA(n_components=min(4, *matrix.shape))
+    scores = pca.fit_transform(scaled)
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+    ax.scatter(scores[:, 0], scores[:, 1])
+    for analyte, (pc1, pc2) in zip(matrix.index, scores[:, :2]):
+        ax.annotate(
+            analyte, (pc1, pc2), xytext=(4, 3),
+            textcoords="offset points", fontsize=9,
+        )
+    ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0] * 100:.1f}%)")
+    ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1] * 100:.1f}%)")
+    suffix = " (IL-1B positive)" if il1b_pos_only else " (all samples)"
+    ax.set_title(f"PCA of Analytes Across Condition Means{suffix}")
     fig.tight_layout()
     return pca, fig

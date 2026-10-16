@@ -22,6 +22,7 @@ from utils.my_funcs import (
     ANALYTE_COLUMNS,
     complete_analyte_columns,
     pca_analytes,
+    pca_transposed_analytes,
     plot_condition,
     plot_cytokine,
     safe_filename,
@@ -34,19 +35,31 @@ OUTPUT_DIR = FIGURE_DIR / "02_initial_viz"
 
 def plot_pca_outputs(df: pd.DataFrame, analytes: list[str]) -> None:
     """Save PCA score and loading plots."""
-    # including +/- IL1B
-    _, fig = pca_analytes(df, analytes)
-    save_figure(fig, OUTPUT_DIR / "pca" / "pca_all_samples.png")
 
-    # only IL1B+ condition
-    pca, fig = pca_analytes(df, analytes, il1b_pos_only=True)
-    save_figure(fig, OUTPUT_DIR / "pca" / "pca_il1b_positive.png")
+    # make 2 PCA plots, one colored by num macs and one by num ESCs
+    for color_by in ["num macrophages", "num ESCs"]:
+        suffix = "_num_macrophages" if color_by == "num macrophages" else "_num_ESCs"
+        _, fig = pca_analytes(df, analytes, color_by=color_by)
+        save_figure(fig, OUTPUT_DIR / "pca" / f"pca_all_samples{suffix}.png")
 
+        pca, fig = pca_analytes(
+            df, analytes, il1b_pos_only=True, color_by=color_by
+        )
+        save_figure(fig, OUTPUT_DIR / "pca" / f"pca_il1b_positive{suffix}.png")
+
+    for positive_only, suffix in [(False, "all_samples"), (True, "il1b_positive")]:
+        _, fig = pca_transposed_analytes(df, analytes, il1b_pos_only=positive_only)
+        save_figure(fig, OUTPUT_DIR / "pca" / f"pca_transposed_{suffix}.png")
+
+    pca, score_fig = pca_analytes(df, analytes)
+    plt.close(score_fig)
     loadings = pd.DataFrame(
         pca.components_.T,
         index=analytes,
         columns=[f"PC{i + 1}" for i in range(pca.n_components_)],
     )
+
+    # plot the PC loadings (for all data, +/- IL1B)
     fig, axs = plt.subplots(2, 1, figsize=(12, 10))
     for ax, component in zip(axs, ["PC1", "PC2"]):
         ordered = loadings[component].sort_values(key=abs, ascending=False)
@@ -218,6 +231,46 @@ def inflammatory_readouts(df: pd.DataFrame):
         )
 
 
+def plot_macrophage_nfkb_by_esc_count(
+    df: pd.DataFrame, cell_counts: pd.DataFrame | None = None
+) -> None:
+    """Match macrophage NFκB well means to whole-droplet ESC counts."""
+    if cell_counts is None:
+        cell_counts = pd.read_csv(DATA_DIR / "cell_counts.csv")
+    wells = (
+        df.loc[df["cell_type"] == "macrophage"]
+        .groupby(["bio_rep", "condition"])["channel_3_nc_ratio"]
+        .mean().reset_index()
+    )
+    # nucleus_data identifies wells by row letter and numeric condition.
+    wells["well_id"] = (
+        wells["bio_rep"].astype(str).str.upper()
+        + wells["condition"].astype(int).astype(str).str.zfill(2)
+    )
+    counts = cell_counts[["well_id", "num ESCs"]].copy()
+    counts["well_id"] = counts["well_id"].str.strip().str.upper()
+    wells = wells.merge(counts, on="well_id", how="left", validate="one_to_one", indicator=True)
+    missing = wells.loc[(wells["_merge"] != "both") | wells["num ESCs"].isna(), "well_id"]
+    if not missing.empty:
+        raise ValueError(f"Missing whole-droplet ESC counts for wells: {', '.join(missing)}")
+    wells = wells.drop(columns="_merge")
+    wells["saw_il1b"] = wells["bio_rep"].isin(["B", "C", "D"])
+    wells = wells.dropna(subset=["channel_3_nc_ratio"])
+    fig, ax = plt.subplots(figsize=(7, 6))
+    sns.scatterplot(
+        data=wells, x="num ESCs", y="channel_3_nc_ratio", hue="saw_il1b",
+        hue_order=[False, True], palette={False: "tab:blue", True: "tab:orange"},
+        s=65, ax=ax,
+    )
+    ax.set_title("macrophage NFkB n:c")
+    ax.set_xlabel("Whole-droplet ESC count")
+    ax.set_ylabel("mean NFkB n:c")
+    fig.tight_layout()
+    output_dir = OUTPUT_DIR / "inflammation" / "NFkB_n_c"
+    save_figure(fig, output_dir / "macrophage_by_esc_count.png")
+    wells.to_csv(output_dir / "macrophage_by_esc_count.csv", index=False)
+
+
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     merged_df = pd.read_csv(DATA_DIR / "merged_data.csv")
@@ -235,6 +288,7 @@ def main():
 
     per_cell_df = pd.read_csv(DATA_DIR / "nucleus_data.csv")
     inflammatory_readouts(per_cell_df)
+    plot_macrophage_nfkb_by_esc_count(per_cell_df)
 
     print(f"Saved figures to {OUTPUT_DIR}")
 
